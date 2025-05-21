@@ -14,7 +14,8 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-force-graph": "^1.47.6",
-    "react-force-graph-2d": "^1.27.1"
+    "react-force-graph-2d": "^1.27.1",
+    "trianglify": "^4.1.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
