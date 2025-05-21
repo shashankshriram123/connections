@@ -1,66 +1,86 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from instagram_handle_checker import is_instagram_username_taken
-import sqlite3
+import os
+import random
+import string
+import smtplib
+from email.message import EmailMessage
 
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, EmailStr
+import redis
+
+# ── Load .env ────────────────────────────────────────────────────────────
+load_dotenv()  # make sure .env is next to this file
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB   = int(os.getenv("REDIS_DB", 0))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")       # your full Gmail address
+SMTP_PASS = os.getenv("SMTP_PASS")       # your 16-char App Password (spaces OK if quoted)
+FROM_ADDR = SMTP_USER                    # or any no-reply@yourdomain.com
+
+# ── Redis client ─────────────────────────────────────────────────────────
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+
+# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Change in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class EmailRequest(BaseModel):
+    email: EmailStr
 
-# Database setup
-conn = sqlite3.connect("db.sqlite3", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS connections (
-    user TEXT,
-    friend TEXT
-)
-""")
-conn.commit()
+    @classmethod
+    def __get_validators__(cls):
+        yield from EmailStr.__get_validators__()
+        yield cls.check_domain
 
-class UserData(BaseModel):
-    user: str
-    friends: list[str]
+    @classmethod
+    def check_domain(cls, v: str) -> str:
+        if not v.endswith("@ucmerced.edu"):
+            raise ValueError("Email must end with @ucmerced.edu")
+        return v
 
-@app.post("/add_user")
-def add_user(data: UserData):
-    # Validate Instagram handles
-    if not is_instagram_username_taken(data.user):
-        raise HTTPException(status_code=400, detail=f"IG handle '{data.user}' does not exist")
+@app.post("/verify/send")
+def send_code(req: EmailRequest):
+    # 1) Generate a 6-digit code
+    code = "".join(random.choices(string.digits, k=6))
 
-    for friend in data.friends:
-        if not is_instagram_username_taken(friend):
-            raise HTTPException(status_code=400, detail=f"Friend IG handle '{friend}' does not exist")
+    # 2) Store it in Redis with a 15-minute TTL
+    key = f"verify:{req.email}"
+    r.setex(key, 15 * 60, code)
 
-    # Save to DB
-    for friend in data.friends:
-        cursor.execute("INSERT INTO connections (user, friend) VALUES (?, ?)", (data.user, friend))
-    conn.commit()
+    # 3) Compose the email
+    msg = EmailMessage()
+    msg["From"] = FROM_ADDR
+    msg["To"] = req.email
+    msg["Subject"] = "Your Ember verification code"
+    msg.set_content(f"Hello!\n\nYour verification code is: {code}\nIt expires in 15 minutes.\n\n— Ember team")
 
-    return {"status": "added"}
+    # 4) Send via Gmail SMTP
+    try:
+        with smtplib.SMTP(host=SMTP_HOST, port=SMTP_PORT, timeout=10) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+    except Exception as e:
+        # If sending fails, remove the code so they can retry
+        r.delete(key)
+        raise HTTPException(500, f"Error sending email: {e}")
 
-@app.get("/graph")
-def get_graph():
-    cursor.execute("SELECT user, friend FROM connections")
-    edges = cursor.fetchall()
+    return {"success": True}
 
-    nodes = set()
-    links = []
-
-    for user, friend in edges:
-        nodes.add(user)
-        nodes.add(friend)
-        links.append({"source": user, "target": friend})
-
-    return {
-        "nodes": [{"id": n} for n in nodes],
-        "links": links
-    }
+@app.post("/verify/check")
+def check_code(req: EmailRequest, code: str):
+    key = f"verify:{req.email}"
+    stored = r.get(key)
+    if not stored:
+        raise HTTPException(400, "No code found or code expired")
+    if stored != code:
+        raise HTTPException(400, "Incorrect code")
+    # Consume the code
+    r.delete(key)
+    return {"verified": True}
